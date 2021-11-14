@@ -61,8 +61,8 @@ def repeat_interleave(input, repeats, dim=0):
     torch.repeat_interleave is currently very slow
     https://github.com/pytorch/pytorch/issues/31980
     """
-    output = input.unsqueeze(1).expand(-1, repeats, *input.shape[1:])
-    return output.reshape(-1, *input.shape[1:])
+    output = input.unsqueeze(1).expand(-1, repeats, *input.shape[1:])   # NS 횟수만큼 repeat시키기 
+    return output.reshape(-1, *input.shape[1:])     # <- NS만큼 늘려주고 다시 원래 사이즈 (batch*NS, inputs))로 만들려했었음! 정말 repeat의 효과!
 
 
 def get_image_to_tensor_balanced(image_size=0):
@@ -123,19 +123,20 @@ def unproj_map(width, height, f, c=None, device="cpu"):
     """
     if c is None:
         c = [width * 0.5, height * 0.5]
-    else:
-        c = c.squeeze()
     if isinstance(f, float):
         f = [f, f]
     elif len(f.shape) == 0:
         f = f[None].expand(2)
     elif len(f.shape) == 1:
         f = f.expand(2)
+    
+    # 어차피 ResNet에 들어가니까 height, width 다 동일하지 않나..? -> batch size만큼 repeat해주기 아 근데 c만큼이 또 다르구나.. 
+    # 이거 torch.meshgrid 확인해보기 
     Y, X = torch.meshgrid(
         torch.arange(height, dtype=torch.float32) - float(c[1]),
         torch.arange(width, dtype=torch.float32) - float(c[0]),
     )
-    X = X.to(device=device) / float(f[0])
+    X = X.to(device=device) / float(f[0])       # focal length의 문제같기도..
     Y = Y.to(device=device) / float(f[1])
     Z = torch.ones_like(X)
     unproj = torch.stack((X, -Y, -Z), dim=-1)
@@ -238,20 +239,22 @@ def bbox_sample(bboxes, num_pix):
 def gen_rays(poses, width, height, focal, z_near, z_far, c=None, ndc=False):
     """
     Generate camera rays
-    :return (B, H, W, 8)
+    :return (B, H, W, 8) # 여기서의 B는 NV인데.. -> ours는 NV = 1
     """
     num_images = poses.shape[0]
     device = poses.device
     cam_unproj_map = (
-        unproj_map(width, height, focal.squeeze(), c=c, device=device)
-        .unsqueeze(0)
-        .repeat(num_images, 1, 1, 1)
-    )
+        unproj_map(width, height, focal, c=c, device=device)      
+        .unsqueeze(0)      
+        .repeat(num_images, 1, 1, 1)     # 어차피 NV여도 f,c 는 전부 동일하니까!-> 바로 repeat num_images 
+    )       # output: (H, W, 3)
     cam_centers = poses[:, None, None, :3, 3].expand(-1, height, width, -1)
+    # poses dimension: (NV, 4, 4) 
+
     cam_raydir = torch.matmul(
-        poses[:, None, None, :3, :3], cam_unproj_map.unsqueeze(-1)
+        poses[:, None, None, :3, :3], cam_unproj_map.unsqueeze(-1)      # (NV, 1, 1, 3, 3) x (H, W, 3, 1) -> (NV, 1, 1, 3, 1) -> (NV, 1, 1, 3)
     )[:, :, :, :, 0]
-    if ndc:
+    if ndc:     #  False
         if not (z_near == 0 and z_far == 1):
             warnings.warn(
                 "dataset z near and z_far not compatible with NDC, setting them to 0, 1 NOW"

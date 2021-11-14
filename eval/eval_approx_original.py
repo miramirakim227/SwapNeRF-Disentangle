@@ -57,8 +57,7 @@ args.resume = True
 
 device = util.get_cuda(args.gpu_id[0])
 net = make_model(conf["model"]).to(device=device)
-net.load_weights(args)      # 이거 하면 이제 neural renderer까지 가져와짐!
-
+net.load_weights(args)
 
 if args.coarse:
     net.mlp_fine = None
@@ -119,10 +118,8 @@ with torch.no_grad():
             dest_view += dest_view >= src_view[:, i : i + 1]
 
         dest_poses = util.batched_index_select_nd(poses, dest_view)
-        
-        feat_H, feat_W = 16, 16
         all_rays = util.gen_rays(
-            dest_poses.reshape(-1, 4, 4), feat_W, feat_H, focal, z_near, z_far
+            dest_poses.reshape(-1, 4, 4), W, H, focal, z_near, z_far
         ).reshape(SB, -1, 8)
 
         pri_images = util.batched_index_select_nd(images, src_view)  # (SB, NS, 3, H, W)
@@ -133,14 +130,10 @@ with torch.no_grad():
             pri_poses.to(device=device),
             focal.to(device=device),
         )
-         
-             # NV = 1            # ray: 16 x 16
-        featmap = render_par(all_rays.to(device=device))        # (4, 16384, 8) -> (batch, #ray, 8)
-        rgb_fine = net.neural_renderer(featmap)
 
+        rgb_fine, _depth = render_par(all_rays.to(device=device))
+        _depth = None
         rgb_fine = rgb_fine.reshape(SB, H, W, 3).cpu().numpy()
-
-
         images_gt = util.batched_index_select_nd(images_0to1, dest_view).reshape(
             SB, 3, H, W
         )

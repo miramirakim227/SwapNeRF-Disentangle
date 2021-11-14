@@ -10,18 +10,16 @@ from util import repeat_interleave
 import os
 import os.path as osp
 import warnings
-import torch.nn.functional as F
-from .neural_renderer import NeuralRenderer
-import pdb 
+
 
 class PixelNeRFNet(torch.nn.Module):
-    def __init__(self, conf, decoder, device=None, stop_encoder_grad=False):
+    def __init__(self, conf, stop_encoder_grad=False):
         """
         :param conf PyHocon config subtree 'model'
         """
         super().__init__()
         self.encoder = make_encoder(conf["encoder"])    # encoder type  # resnet34, pretrainedTrue, num_layers4
-            # encoder 설정 -> ours encoder! 
+            # encoder 설정만 해놓음 
         self.use_encoder = conf.get_bool("use_encoder", True)  # Image features?        # True
 
         self.use_xyz = conf.get_bool("use_xyz", False)  # True로 설정되어 있음. use xyz instead of just z 
@@ -74,7 +72,7 @@ class PixelNeRFNet(torch.nn.Module):
         self.mlp_coarse = make_mlp(conf["mlp_coarse"], d_in, d_latent, d_out=d_out)     # mlpcoarse: resnet, n_blocks=3, d_hidden=512
         self.mlp_fine = make_mlp(
             conf["mlp_fine"], d_in, d_latent, d_out=d_out, allow_empty=True     # same as above
-        )   # resnet 
+        )
         # Note: this is world -> camera, and bottom row is omitted
         self.register_buffer("poses", torch.empty(1, 3, 4), persistent=False)
         self.register_buffer("image_shape", torch.empty(2), persistent=False)
@@ -88,17 +86,13 @@ class PixelNeRFNet(torch.nn.Module):
 
         self.num_objs = 0
         self.num_views_per_obj = 1
-        if device is None:
-            device = self.poses.device
-        self.decoder = decoder.to(device)
 
-        self.neural_renderer = NeuralRenderer().to(device)
 
     #######################################################################################
     ################### 여기서부터 잘 집중해서 읽어보기! encode하는 부분에서도 잘 가져오기!! #############
-    #####################################################################################
+    #######################################################################################
 
-    def encode(self, images, poses=None, focal=None, z_bounds=None, c=None):
+    def encode(self, images, poses, focal, z_bounds=None, c=None):
         """
         :param images (NS, 3, H, W)         (B, 3, H, W) <- Ns: num of views 대신 batch size로 규정!
         NS is number of input (aka source or reference) views
@@ -111,24 +105,22 @@ class PixelNeRFNet(torch.nn.Module):
 
         self.num_objs = images.size(0)      # images.shape -> since single view, : (4, 1, 3, 128, 128) <- batch ,single view image 
 
-        if len(images.shape) == 5:          # Be consistent with NS = num input views
+        if len(images.shape) == 5:
+            assert len(poses.shape) == 4
+            assert poses.size(1) == images.size(
+                1
+            )  # Be consistent with NS = num input views
             self.num_views_per_obj = images.size(1)
             images = images.reshape(-1, *images.shape[2:])  # 아예 num_views의 흔적을 없앰, (-1(B, NV merged!), 3, 128, 128)
+            poses = poses.reshape(-1, 4, 4)     
         else:
             self.num_views_per_obj = 1
 
-        # image : (batch, 3, H, W)로 들어옴
-        # pose = (batch, 4, 4)로 만들어줘야 함              # 여기서 예측된 self.poses가 GT poses를 대체함 
-        self.rotmat, self.shape, self.appearance = self.encoder(images)        # self.latents만 따로 활용하려고 사용함! -> self.latent가 따로 저장됨!, self.latent_scaling도 따로 저장됨
+        self.encoder(images)        # self.latents만 따로 활용하려고 사용함! -> self.latent가 따로 저장됨!, self.latent_scaling도 따로 저장됨
         # 위에까지가 feature 얻는 부분 
-            
-        if poses == None:
-            poses = self.rotmat
-        else:
-            poses = poses.reshape(-1, 4, 4)     
-
-        # 여기서부터 가져올 부분 poses -> self.rotmat으로 대체 
-        rot = poses[:, :3, :3].transpose(1, 2)  # (B, 3, 3)     # 역행렬 -> 원래의 rotation으로 바꿔준다 
+                
+        # 여기서부터 가져올 부분 pose
+        rot = poses[:, :3, :3].transpose(1, 2)  # (B, 3, 3)
         trans = -torch.bmm(rot, poses[:, :3, 3:])  # (B, 3, 1)      # 이 translation이 의외군.. 
         self.poses = torch.cat((rot, trans), dim=-1)  # (B, 3, 4)
 
@@ -147,6 +139,7 @@ class PixelNeRFNet(torch.nn.Module):
         else:
             focal = focal.clone()
         self.focal = focal.float()     # 가장 마지막의 값들에 -1이 곱해짐 
+
         self.focal[..., 1] *= -1.0
 
         if c is None:
@@ -162,14 +155,15 @@ class PixelNeRFNet(torch.nn.Module):
 
         if self.use_global_encoder:     # False
             self.global_encoder(images)
-        return self.shape, self.appearance 
+
+
 
     #######################################################################################
     ################### 여기서부터 잘 집중해서 읽어보기! xyz 만드는 과정도 똑같이 할 것! ################
     #######################################################################################
 
     ### 여기서부터 잘 집중해서 읽어보기!!! + xyz는 어쨌든 sampling된 query points인데 어떻게 나오게 된 건지 파악하기!
-    def forward(self, xyz, num_pts, shape, appearance, coarse=True, viewdirs=None, training=False, far=False):  # world space points xyz
+    def forward(self, xyz, coarse=True, viewdirs=None, far=False):  # world space points xyz
         # 어차피 여기 한번밖에 안지나감 괜쫄!
         # xyz: (batch, #rays * #points, 3)
         """
@@ -182,9 +176,13 @@ class PixelNeRFNet(torch.nn.Module):
         :return (SB, B, 4) r g b sigma
         """
         with profiler.record_function("model_inference"):       # memory, time tracking tool -> 한번 다 합치고 돌려보기!
+            import pdb 
             SB, B, _ = xyz.shape       # SB: batch of objects, B: num_rays * num_points -> batch of points in rays -> 리얼 한 세트로 돌리네! 굿! 배치마다의 샘플 속 모든 ray를 포괄!
+            NS = self.num_views_per_obj     # NS = 1 when single view 
+
             ##################################################################################
             # Transform query points into the camera spaces of the input views
+            xyz = repeat_interleave(xyz, NS)  # (SB*NS, B, 3)   
             xyz_rot = torch.matmul(self.poses[:, None, :3, :3], xyz.unsqueeze(-1))[     # xyz를 self.poses로 rotate -> transpose했던거에 다시 연산됨..! -> 헐 그러면 이 상태에서 예측하는건가보다 그러면 이게 sampled points고 앞에 camera가 원래 ray에서...!
                                                                                         # 그래야 transformation이 말이 되는 듯.. 근데 그럴거면 왜 transformation을 예측하지..? 
                 ..., 0                                                                  # 아무튼 여기가 transform query points into the camera spaces! (self.poses를 곱함!)
@@ -193,16 +191,77 @@ class PixelNeRFNet(torch.nn.Module):
             xyz = xyz_rot + self.poses[:, None, :3, 3]      # 얘네가 sampling points!     # 아무튼 여기가 transform query points into the camera spaces! (self.poses를 곱함!) 
             # Transform query points into the camera spaces of the input views
             ##################################################################################
-            # * Encode the xyz coordinates
-            z_feature = xyz_rot.reshape(SB, -1, 3)  # (SB*B, 3) # (65536, 3) -> (SB * num_ray * num_points, 3)  -> (4 * 256 * 64, 3)
+            if self.d_in > 0:   # True
+                # * Encode the xyz coordinates
+                if self.use_xyz:    # True
+                    if self.normalize_z:    # True
+                        z_feature = xyz_rot.reshape(-1, 3)  # (SB*B, 3)
+                    else:
+                        z_feature = xyz.reshape(-1, 3)  # (SB*B, 3)
+                else:
+                    if self.normalize_z:
+                        z_feature = -xyz_rot[..., 2].reshape(-1, 1)  # (SB*B, 1)
+                    else:
+                        z_feature = -xyz[..., 2].reshape(-1, 1)  # (SB*B, 1)
 
-            # Viewdirs to input view space
-            viewdirs = viewdirs.reshape(SB, B, 3, 1)
-            viewdirs = torch.matmul(
-                self.poses[:, None, :3, :3], viewdirs   # pose에 viewdir 곱함 <- 위에와 마찬가지로 곱해줌!!
-            )  # (SB*NS, B, 3, 1)
-            viewdirs = viewdirs.reshape(SB, -1, 3)  # (SB*B, 3)
-            
+                if self.use_code and not self.use_code_viewdirs:    # True 
+                    # Positional encoding <- view direction에서는 encoding을 안해줌.. <- ours 세팅 보면서 다시 비교해보자
+                    z_feature = self.code(z_feature)       # OK
+
+                if self.use_viewdirs:                      # True
+                    # * Encode the view directions
+                    assert viewdirs is not None
+                    # Viewdirs to input view space
+                    viewdirs = viewdirs.reshape(SB, B, 3, 1)
+                    viewdirs = repeat_interleave(viewdirs, NS)  # (SB*NS, B, 3, 1)
+                    viewdirs = torch.matmul(
+                        self.poses[:, None, :3, :3], viewdirs   # pose에 viewdir 곱함 <- 위에와 마찬가지로 곱해줌!!
+                    )  # (SB*NS, B, 3, 1)
+                    viewdirs = viewdirs.reshape(-1, 3)  # (SB*B, 3)
+                    
+                    z_feature = torch.cat(
+                        (z_feature, viewdirs), dim=1            # z_features: sampled points, viewdirs: viewing direction 
+                    )  # (SB*B, 4 or 6)
+
+                if self.use_code and self.use_code_viewdirs:
+                    # Positional encoding (with viewdirs)
+                    z_feature = self.code(z_feature)
+
+                mlp_input = z_feature
+
+            if self.use_encoder:
+                # Grab encoder's latent code.
+                uv = -xyz[:, :, :2] / xyz[:, :, 2:]  # (SB, B, 2)
+                uv *= repeat_interleave(
+                    self.focal.unsqueeze(1), NS if self.focal.shape[0] > 1 else 1       # 오키.. focal 값이 크긴 크구나.. 
+                )
+                uv += repeat_interleave(
+                    self.c.unsqueeze(1), NS if self.c.shape[0] > 1 else 1
+                )  # (SB*NS, B, 2)
+                latent = self.encoder.index(
+                    uv, None, self.image_shape
+                )  # (SB * NS, latent, B)
+
+                if self.stop_encoder_grad:
+                    latent = latent.detach()
+                latent = latent.transpose(1, 2).reshape(
+                    -1, self.latent_size
+                )  # (SB * NS * B, latent)
+
+                if self.d_in == 0:
+                    # z_feature not needed
+                    mlp_input = latent
+                else:
+                    mlp_input = torch.cat((latent, z_feature), dim=-1)
+
+            if self.use_global_encoder:     # False
+                # Concat global latent code if enabled
+                global_latent = self.global_encoder.latent
+                assert mlp_input.shape[0] % global_latent.shape[0] == 0
+                num_repeats = mlp_input.shape[0] // global_latent.shape[0]
+                global_latent = repeat_interleave(global_latent, num_repeats)
+                mlp_input = torch.cat((global_latent, mlp_input), dim=-1)
+
             # Camera frustum culling stuff, currently disabled
             combine_index = None
             dim_size = None
@@ -212,21 +271,32 @@ class PixelNeRFNet(torch.nn.Module):
             #######################################################################################
 
             # 여기서가 여태까지 샘플링했던 ray, points 전부 해결해주는 곳. 
-            # 얘도 뭔가 그냥 아예 batch 단위로 한번에 들어가버림 
+            # 
             # Run main NeRF network
-            # images       dim 맞음! # feature, viewdirs, shape, appearance dimension 맞춰주기 
-            feat, sigma = self.decoder(z_feature, viewdirs, shape, appearance)        # z_feature, viewdirs, : (batch, -1, 3), shape&app : (batch, 256)
-            if training:
-                sigma += torch.randn_like(sigma)
-            sigma_i = sigma.reshape(SB, B // num_pts, num_pts)          # 4, 256, 64
-            feat_i = feat.reshape(SB, B // num_pts, num_pts, -1)        # 4, 256, 64, 128
+            if coarse or self.mlp_fine is None:     # 3D RGB, density output
+                mlp_output = self.mlp_coarse(
+                    mlp_input,  # (batch(4)*ray(128)*sampling points(64)=32768, latent(512)&xyz(42)&dr(3)=42)
+                    combine_inner_dims=(self.num_views_per_obj, B),
+                    combine_index=combine_index,
+                    dim_size=dim_size,
+                )
+            else:
+                mlp_output = self.mlp_fine(
+                    mlp_input,
+                    combine_inner_dims=(self.num_views_per_obj, B),
+                    combine_index=combine_index,
+                    dim_size=dim_size,
+                )       # (batch (4), 8192 (ray(128)*points(64)), 4)  
 
-            feat = feat_i
-            sigma = F.relu(sigma_i).unsqueeze(-1)
-            
-            output_list = [feat, sigma]
+            # Interpret the output
+            mlp_output = mlp_output.reshape(-1, B, self.d_out)
+
+            rgb = mlp_output[..., :3]
+            sigma = mlp_output[..., 3:4]
+
+            output_list = [torch.sigmoid(rgb), torch.relu(sigma)]
             output = torch.cat(output_list, dim=-1)
-            output = output.reshape(SB, B, -1)   # (4, ray(128)*sampling points(64) -> (8192), feat_dim+1)
+            output = output.reshape(SB, B, -1)   # (4, ray(128)*sampling points(64) -> (8192), 4)
         return output
         # 이 윗부분만 잘 집중해서 읽어보기!
         # 아 오키. 여기서나온 각 points의 예측된 rgb와 sigma를 가지고 그다음 ray를 한다!
@@ -240,7 +310,7 @@ class PixelNeRFNet(torch.nn.Module):
         Your can put a checkpoint at checkpoints/<exp>/pixel_nerf_init to use as initialization.
         :param opt_init if true, loads from init checkpoint instead of usual even when resuming
         """
-        # TODO: make backups -> giraffe 코드 보고 백업되게 바꾸기 
+        # TODO: make backups
         if opt_init and not args.resume:
             return
         ckpt_name = (
@@ -254,7 +324,7 @@ class PixelNeRFNet(torch.nn.Module):
         if os.path.exists(model_path):
             print("Load", model_path)
             self.load_state_dict(
-                torch.load(model_path, map_location=device), strict=False
+                torch.load(model_path, map_location=device), strict=strict
             )
         elif not opt_init:
             warnings.warn(

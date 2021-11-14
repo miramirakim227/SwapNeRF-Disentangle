@@ -20,8 +20,6 @@ class SpatialEncoder(nn.Module):
         backbone="resnet34",
         pretrained=True,
         num_layers=4,
-        shape_dim=256,
-        app_dim=256,
         index_interp="bilinear",
         index_padding="border",
         upsample_interp="bilinear",
@@ -79,13 +77,36 @@ class SpatialEncoder(nn.Module):
         )
         # self.latent (B, L, H, W)
 
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc1 = nn.Linear(256, 512 )
-        self.fc2 = nn.Linear(512 , 512 )
-        self.dec_shape = nn.Linear(512 , shape_dim)
-        self.dec_appearance = nn.Linear(512 , app_dim)
-        self.dec_rotmat = nn.Linear(512 , 16)
-        # extrinsic should be added later
+    def index(self, uv, cam_z=None, image_size=(), z_bounds=None):      
+        """
+        Get pixel-aligned image features at 2D image coordinates
+        :param uv (B, N, 2) image points (x,y)
+        :param cam_z ignored (for compatibility)
+        :param image_size image size, either (width, height) or single int.
+        if not specified, assumes coords are in [-1, 1]
+        :param z_bounds ignored (for compatibility)
+        :return (B, L, N) L is latent size
+        """
+        with profiler.record_function("encoder_index"):
+            if uv.shape[0] == 1 and self.latent.shape[0] > 1:
+                uv = uv.expand(self.latent.shape[0], -1, -1)
+
+            with profiler.record_function("encoder_index_pre"):
+                if len(image_size) > 0:
+                    if len(image_size) == 1:
+                        image_size = (image_size, image_size)
+                    scale = self.latent_scaling / image_size
+                    uv = uv * scale - 1.0
+
+            uv = uv.unsqueeze(2)  # (B, N, 1, 2)
+            samples = F.grid_sample(
+                self.latent,            # 아.. 이때 만들었던 self.latent를 여기서 사용하는구나.. 뒤에 부분에서..!
+                uv, 
+                align_corners=True,
+                mode=self.index_interp,
+                padding_mode=self.index_padding,
+            )
+            return samples[:, :, :, 0]  # (B, C, N)
 
     def forward(self, x):
         """
@@ -93,40 +114,62 @@ class SpatialEncoder(nn.Module):
         :param x image (B, C, H, W)
         :return latent (B, latent_size, H, W)
         """
-        '''
-        output feature map dimension
-        # latents[0] = (B, 64, 64, 64)
-        # latents[1] = (B, 64, 32, 32)
-        # latents[2] = (B, 128, 16, 16)
-        # latents[3] = (B, 256, 8, 8)
-        '''
         # input resolution: (128, 128)
+        if self.feature_scale != 1.0:
+            x = F.interpolate(
+                x,
+                scale_factor=self.feature_scale,
+                mode="bilinear" if self.feature_scale > 1.0 else "area",
+                align_corners=True if self.feature_scale > 1.0 else None,
+                recompute_scale_factor=True,
+            )
         x = x.to(device=self.latent.device)
 
-        x = self.model.conv1(x)
-        x = self.model.bn1(x)
-        x = self.model.relu(x)
+        if self.use_custom_resnet:
+            self.latent = self.model(x)
+        else:
+            x = self.model.conv1(x)
+            x = self.model.bn1(x)
+            x = self.model.relu(x)
 
-        if self.num_layers > 1:
-            if self.use_first_pool:
-                x = self.model.maxpool(x)
-            x = self.model.layer1(x)
-        if self.num_layers > 2:
-            x = self.model.layer2(x)
-        if self.num_layers > 3:
-            x = self.model.layer3(x)
-        if self.num_layers > 4:
-            x = self.model.layer4(x)
+            latents = [x]
+            if self.num_layers > 1:
+                if self.use_first_pool:
+                    x = self.model.maxpool(x)
+                x = self.model.layer1(x)
+                latents.append(x)
+            if self.num_layers > 2:
+                x = self.model.layer2(x)
+                latents.append(x)
+            if self.num_layers > 3:
+                x = self.model.layer3(x)
+                latents.append(x)
+            if self.num_layers > 4:
+                x = self.model.layer4(x)
+                latents.append(x)
 
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = self.fc1(x)
-        x = self.fc2(x)
-        shape = self.dec_shape(x)
-        appearance = self.dec_appearance(x)
-        rotmat_flat = self.dec_rotmat(x)
-        rotmat = rotmat_flat.reshape(-1, 4, 4)
-        return rotmat, shape, appearance
+            # latents[0] = (B, 64, 64, 64)
+            # latents[1] = (B, 64, 32, 32)
+            # latents[2] = (B, 128, 16, 16)
+            # latents[3] = (B, 256, 8, 8)
+
+            # 이부분은 mask 가져올 때 사용하자 - mask guided!
+            self.latents = latents
+            # 이 피라미드 형으로 된 feature map에서 spatial information 찾아오기 
+            align_corners = None if self.index_interp == "nearest " else True
+            latent_sz = latents[0].shape[-2:]       # 가장 큰 feature map size에 맞춰서 전부 interpolate해줌!
+            for i in range(len(latents)):
+                latents[i] = F.interpolate(
+                    latents[i],
+                    latent_sz,
+                    mode=self.upsample_interp,
+                    align_corners=align_corners,
+                )
+            self.latent = torch.cat(latents, dim=1)
+        self.latent_scaling[0] = self.latent.shape[-1]
+        self.latent_scaling[1] = self.latent.shape[-2]
+        self.latent_scaling = self.latent_scaling / (self.latent_scaling - 1) * 2.0
+        return self.latent
 
     @classmethod
     def from_conf(cls, conf):

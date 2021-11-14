@@ -9,9 +9,8 @@ import torch.nn.functional as F
 import util
 import torch.autograd.profiler as profiler
 from torch.nn import DataParallel
-from dotmap import DotMap
-from model import NeuralRenderer
-import math 
+from dotmap import DotMap   # DotMap은 그냥 dictionary같은 역할
+
 
 class _RenderWrapper(torch.nn.Module):
     def __init__(self, net, renderer, simple_output):
@@ -20,22 +19,29 @@ class _RenderWrapper(torch.nn.Module):
         self.renderer = renderer    # self.renderer 
         self.simple_output = simple_output
 
-    def forward(self, rays, val_num=1, shape=None, appearance=None, want_weights=False, training=False):
+    def forward(self, rays, want_weights=False):
         if rays.shape[0] == 0:
             return (
                 torch.zeros(0, 3, device=rays.device),
                 torch.zeros(0, device=rays.device),
             )
-        if shape == None:
-            raise ValueError('bring shape!')
-        # coarse, fine 둘다 sampling.. 우선은 coarse로 하고 필요하면 fine으로 바꾸기!
+
         ###### 여기에서 밑의 함수로 흘러들어간다!
         ###### self.net = NeRFRenderer
         outputs = self.renderer(
-            self.net, rays, training, val_num, shape, appearance, want_weights=want_weights and not self.simple_output
+            self.net, rays, want_weights=want_weights and not self.simple_output
         )
-        featmap = outputs.feat
-        return featmap
+        if self.simple_output:
+            if self.renderer.using_fine:
+                rgb = outputs.fine.rgb
+                depth = outputs.fine.depth
+            else:
+                rgb = outputs.coarse.rgb
+                depth = outputs.coarse.depth
+            return rgb, depth
+        else:
+            # Make DotMap to dict to support DataParallel
+            return outputs.toDict()
 
 
 class NeRFRenderer(torch.nn.Module):
@@ -75,6 +81,7 @@ class NeRFRenderer(torch.nn.Module):
         self.noise_std = noise_std
         self.depth_std = depth_std
 
+        self.eval_batch_size = eval_batch_size
         self.white_bkgd = white_bkgd
         self.lindisp = lindisp
         if lindisp:
@@ -89,7 +96,6 @@ class NeRFRenderer(torch.nn.Module):
         self.register_buffer(
             "last_sched", torch.tensor(0, dtype=torch.long), persistent=True
         )
-
 
     def sample_coarse(self, rays):
         """
@@ -156,7 +162,7 @@ class NeRFRenderer(torch.nn.Module):
         z_samp = torch.max(torch.min(z_samp, rays[:, -1:]), rays[:, -2:-1])
         return z_samp
 
-    def composite(self, model, rays, shape, appearance, z_samp, training, coarse=True, sb=0):        # 여기서 가져와지는 애들 찾기!
+    def composite(self, model, rays, z_samp, coarse=True, sb=0):        # 여기서 가져와지는 애들 찾기!
         """     
         Render RGB and depth for each ray using NeRF alpha-compositing formula,
         given sampled positions along each ray (see sample_*)
@@ -171,7 +177,6 @@ class NeRFRenderer(torch.nn.Module):
         # nerf.py가 나름 바깥에서 batch 연산을 적용중!
         with profiler.record_function("renderer_composite"):
             B, K = z_samp.shape # B: 512: batcy*ray, K: 64: number of sampled points 
-            # z_coarse = (16*16, 64) 
 
             ###############################################################
             ##################### ray와 sampling의 차이!! ####################
@@ -186,32 +191,55 @@ class NeRFRenderer(torch.nn.Module):
             # (B, K, 3)
                                             # (512, 64, 1)        (512, 1, 3)
             points = rays[:, None, :3] + z_samp.unsqueeze(2) * rays[:, None, 3:6]    # points: (32768, 3) -> (batch*rays*points, 3)
-            points = points.reshape(sb, -1, 3)  # (B*K, 3)
+            points = points.reshape(-1, 3)  # (B*K, 3)
             # generated points along ray
             ################# 두 가지 실험..? 그러면 render할 때도 동일 ray 아니면 고정 ray..? ####
             #############################################################################
 
             use_viewdirs = hasattr(model, "use_viewdirs") and model.use_viewdirs
+
             val_all = []
+            if sb > 0:
+                points = points.reshape(
+                    sb, -1, 3
+                )  # (SB, B'*K, 3) B' is real ray batch size
+                eval_batch_size = (self.eval_batch_size - 1) // sb + 1
+                eval_batch_dim = 1
+            else:
+                eval_batch_size = self.eval_batch_size
+                eval_batch_dim = 0
+
             # points: (4, 8192, 3)
             # eval_batch_size = 25000
             # 아 그냥 eval batch 구분하지 말고 바로 넣기 (어차피 구분 안돼서 들어가고 있었음)
-            dim1 = K    # 64: # sampling points for each ray 
-            viewdirs = rays[:, None, 3:6].expand(-1, dim1, -1)  # (B, K, 3)     # (512 batch * rays, 64 #sampling points , 3)
-            viewdirs = viewdirs.reshape(sb, -1, 3)  # (SB, B'*K, 3)  # (batch, rays*sampling points, 3)
-            out = model(points, num_pts=K, shape=shape, appearance=appearance, coarse=coarse, viewdirs=viewdirs, training=self.training) # pnts, dirs 둘 다 :(4, 8192, 3) <- 뭐야 그냥 그대로 들어가도 되는거였음 
-                # 여기서는 model: PixelNeRFNet의 forward함수로 바로 ㄱㄱ!
+            split_points = torch.split(points, eval_batch_size, dim=eval_batch_dim)
+            if use_viewdirs:
+                dim1 = K    # 64: # sampling points for each ray 
+                viewdirs = rays[:, None, 3:6].expand(-1, dim1, -1)  # (B, K, 3)     # (512 batch * rays, 64 #sampling points , 3)
+                if sb > 0:
+                    viewdirs = viewdirs.reshape(sb, -1, 3)  # (SB, B'*K, 3)
+                else:
+                    viewdirs = viewdirs.reshape(-1, 3)  # (B*K, 3)      # (batch, rays*sampling points, 3)
+                split_viewdirs = torch.split(
+                    viewdirs, eval_batch_size, dim=eval_batch_dim
+                )
+                for pnts, dirs in zip(split_points, split_viewdirs):
+                    val_all.append(model(pnts, coarse=coarse, viewdirs=dirs)) # pnts, dirs 둘 다 :(4, 8192, 3) <- 뭐야 그냥 그대로 들어가도 되는거였음 
+                    # 여기서는 model: PixelNeRFNet의 forward함수로 바로 ㄱㄱ!
 
+            else:
+                for pnts in split_points:
+                    val_all.append(model(pnts, coarse=coarse))
             points = None
             viewdirs = None
 
             # 오케... 여기까지가 sampling points 다 살아있는 상태에서 rgba 계산된 결과!!
             # (B*K, 4) OR (SB, B'*K, 4)
-
+            out = torch.cat(val_all, dim=eval_batch_dim)    # <- 리스트 길이 하나
             out = out.reshape(B, K, -1)  # (B, K, 4 or 5)   (512, 64, 4) <- (batch*#rays, #points, rgba)
 
-            feats = out[..., :-1]  # (B, K, 3)
-            sigmas = out[..., -1]  # (B, K)
+            rgbs = out[..., :3]  # (B, K, 3)
+            sigmas = out[..., 3]  # (B, K)
             if self.training and self.noise_std > 0.0:
                 sigmas = sigmas + torch.randn_like(sigmas) * self.noise_std
 
@@ -226,20 +254,21 @@ class NeRFRenderer(torch.nn.Module):
             alphas = None
             alphas_shifted = None
 
-            feat_final = torch.sum(weights.unsqueeze(-1) * feats, -2)  # (B, 3)
+            rgb_final = torch.sum(weights.unsqueeze(-1) * rgbs, -2)  # (B, 3)
+            depth_final = torch.sum(weights * z_samp, -1)  # (B)
             # compositing 성공!
-
-            # 여기에 neural renderer 넣기 -> net에 최종으로 잘 들어가는지 확인!
-
-
-            # for white background -> 일단은 빼자!
-            # pix_alpha = weights.sum(dim=1)  # (B), pixel alpha
-            # rgb_final = rgb_final + 1 - pix_alpha.unsqueeze(-1)  # (B, 3)
-
-            return feat_final
+            if self.white_bkgd:
+                # White background
+                pix_alpha = weights.sum(dim=1)  # (B), pixel alpha
+                rgb_final = rgb_final + 1 - pix_alpha.unsqueeze(-1)  # (B, 3)
+            return (
+                weights,
+                rgb_final,
+                depth_final,
+            )
 
     def forward(
-        self, model, rays, training, val_num, shape, appearance, want_weights=False,
+        self, model, rays, want_weights=False,
     ):
         """
         :model nerf model, should return (SB, B, (r, g, b, sigma))
@@ -257,31 +286,44 @@ class NeRFRenderer(torch.nn.Module):
                 self.n_fine = self.sched[2][self.last_sched.item() - 1]
 
             assert len(rays.shape) == 3
-            superbatch_size = rays.shape[0] # (1, 16*16, 8)
-            rays = rays.reshape(-1, 8)  # (SB * B, 8) -> (16*16, 8)
-            ray_res = int(math.sqrt(rays.shape[0]/ val_num / superbatch_size))  # -> 16
+            superbatch_size = rays.shape[0]
+            rays = rays.reshape(-1, 8)  # (SB * B, 8)
 
-            z_coarse = self.sample_coarse(rays)  # (B, Kc)  # coarse        # sampled points  -> (16*16, 8) -> 64도 same
-            # -> z_coarse = (1024 (4 * 256), 64), rays = (1024 (4 * 256), 8)
+            z_coarse = self.sample_coarse(rays)  # (B, Kc)  # coarse        # sampled points 
             coarse_composite = self.composite(               # given models, rays, z_coars values, -> sampled points along ray! 
-                model, rays, shape, appearance, z_coarse, training, coarse=True, sb=superbatch_size,
-            ).reshape(superbatch_size * val_num, -1, ray_res, ray_res)   # [1]: feat -> (batch*ray, feat_dim) -> 우리는 여기서 2DCNN을 가져와서 돌려야 함!   -> 각 ray가 rgb가 아닌 feature를 가지고 있기 때문!
-
-            # for visualization -> 정리하기!
-            # rgb_np= np.array(rgb.detach().cpu())
-            # out_file_name = 'visualization_%010d.png' % it
-            # image_grid = make_grid(torch.cat((x_real, image_fake.clamp_(0., 1.), image_swap.clamp_(0., 1.), image_rand.clamp_(0., 1.)), dim=0), nrow=image_fake.shape[0])
-            # save_image(image_grid, os.path.join(self.val_vis_dir, out_file_name))
+                model, rays, z_coarse, coarse=True, sb=superbatch_size,
+            )   # [1]: rgb -> (batch*ray, 3) -> 우리는 여기서 2DCNN을 가져와서 돌려야 함!   -> 각 ray가 rgb가 아닌 feature를 가지고 있기 때문!
 
             ################################################################
             ################## 여기까지 해서, 최종 ray 뽑자 ######################
             ################################################################
             ################################################################
             outputs = DotMap(
-                feat=self._format_outputs(
+                coarse=self._format_outputs(
                     coarse_composite, superbatch_size, want_weights=want_weights,
-                ),  # 이거를 coarse.rgb로 호출할 수 있게 됨!
+                ),
             )
+
+
+            if self.using_fine:
+                all_samps = [z_coarse]
+                if self.n_fine - self.n_fine_depth > 0:
+                    all_samps.append(
+                        self.sample_fine(rays, coarse_composite[0].detach())
+                    )  # (B, Kf - Kfd)
+                if self.n_fine_depth > 0:
+                    all_samps.append(
+                        self.sample_fine_depth(rays, coarse_composite[2])
+                    )  # (B, Kfd)
+                z_combine = torch.cat(all_samps, dim=-1)  # (B, Kc + Kf)
+                z_combine_sorted, argsort = torch.sort(z_combine, dim=-1)
+                fine_composite = self.composite(
+                    model, rays, z_combine_sorted, coarse=False, sb=superbatch_size,
+                )
+                outputs.fine = self._format_outputs(
+                    fine_composite, superbatch_size, want_weights=want_weights,
+                )
+            # _format_outputs -> 거치면 -> 최종 rgb 나옴!
             return outputs
 
     def _format_outputs(
@@ -289,10 +331,15 @@ class NeRFRenderer(torch.nn.Module):
     ):
         # rendered_outputs: (batch * rays, 3)
         # superbatch로 reshape -> (batch, rays, 3)
-        feat_map = rendered_outputs  # 
-        # if superbatch_size > 0:
-        #     feat_map = feat.reshape(superbatch_size, -1, 128)  # batch, rays, #feat
-        return feat_map
+        weights, rgb, depth = rendered_outputs
+        if superbatch_size > 0:
+            rgb = rgb.reshape(superbatch_size, -1, 3)
+            depth = depth.reshape(superbatch_size, -1)
+            weights = weights.reshape(superbatch_size, -1, weights.shape[-1])
+        ret_dict = DotMap(rgb=rgb, depth=depth)
+        if want_weights:
+            ret_dict.weights = weights
+        return ret_dict
 
     def sched_step(self, steps=1):
         """

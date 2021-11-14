@@ -27,7 +27,7 @@ def get_split_dataset(dataset_type, datadir, want_split="all", training=True, **
         dset_class = MultiObjectDataset
     elif dataset_type.startswith("dvr"):
         # For ShapeNet 64x64
-        dset_class = DVRDataset
+        dset_class = DVRDataset         # dset_class
         if dataset_type == "dvr_gen":
             # For generalization training (train some categories, eval on others)
             flags["list_prefix"] = "gen_"

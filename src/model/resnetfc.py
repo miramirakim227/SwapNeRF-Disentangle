@@ -129,7 +129,8 @@ class ResnetFC(nn.Module):
         else:
             self.activation = nn.ReLU()
 
-    def forward(self, zx, combine_inner_dims=(1,), combine_index=None, dim_size=None):
+    # 여기서부터는 decoder layers <- ResNetFC를 NeRF MLP layers로 대체하기 
+    def forward(self, shape, appearance, zx, combine_inner_dims=(1,), combine_index=None, dim_size=None):
         """
         :param zx (..., d_latent + d_in)
         :param combine_inner_dims Combining dimensions for use with multiview inputs.
